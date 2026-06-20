@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# local memory stores
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.cognitive-mcp/
+
+# misc
+*.log
+.DS_Store
+.env
+.env.*

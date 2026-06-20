@@ -1,0 +1,57 @@
+{
+  "name": "cognitive-mcp",
+  "version": "0.1.0",
+  "description": "Persistent, local-first memory for AI agents over the Model Context Protocol. One SQLite file, four tools, zero cloud.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Think-Zone",
+  "homepage": "https://github.com/think-zone/cognitive-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/think-zone/cognitive-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/think-zone/cognitive-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "agent-memory",
+    "ai",
+    "llm",
+    "claude",
+    "cursor",
+    "sqlite",
+    "local-first",
+    "stdio"
+  ],
+  "bin": {
+    "cognitive-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "smoke": "node test/smoke.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
