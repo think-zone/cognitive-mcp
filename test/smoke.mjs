@@ -86,6 +86,13 @@ try {
   });
   check("no-match search returns 0", s0.structuredContent?.total === 0);
 
+  // whitespace-only query should be rejected
+  const whitespace = await client.callTool({
+    name: "memory_search",
+    arguments: { query: "   ", response_format: "json" },
+  });
+  check("whitespace-only search query is rejected", whitespace.isError === true);
+
   // tag filter via list
   const l = await client.callTool({
     name: "memory_list",
