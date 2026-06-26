@@ -1,7 +1,7 @@
 {
   "name": "cognitive-mcp",
-  "version": "0.1.0",
-  "description": "Persistent, local-first memory for AI agents over the Model Context Protocol. One SQLite file, four tools, zero cloud.",
+  "version": "0.2.0",
+  "description": "Persistent, local-first memory for AI agents over the Model Context Protocol. FTS5 ranked search, weighted decay, contexts, and a memory graph — one SQLite file, zero cloud.",
   "type": "module",
   "license": "MIT",
   "author": "Think-Zone",
