@@ -40,7 +40,7 @@ export function normalizeTags(tags: string[]): string[] {
   return out;
 }
 export function tokenize(query: string): string[] {
-  return query.split(/s+/).map(t => t.trim()).filter(t => t.length > 0);
+  return query.split(/\s+/).map(t => t.trim()).filter(t => t.length > 0);
 }
 function escapeFts(term: string): string { return '"' + term.replace(/"/g, '""') + '"'; }
 
