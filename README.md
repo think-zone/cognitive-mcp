@@ -1,35 +1,34 @@
 # cognitive-mcp
 
-> **Persistent memory for AI agents — local-first, over the [Model Context Protocol](https://modelcontextprotocol.io).**
-> One SQLite file. Four tools. No server, no account, no cloud.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Think-Zone](https://img.shields.io/badge/Think--Zone-Ecosystem-blueviolet)](https://github.com/think-zone)
-
----
+Persistent memory for AI agents — local-first, over the Model Context Protocol. One SQLite file. No server, no account, no cloud.
 
 ## What it does
 
-Most AI agents forget everything the moment a conversation ends. **cognitive-mcp** gives them a memory that survives across sessions.
+Most AI agents forget everything the moment a conversation ends. `cognitive-mcp` gives them a memory that survives across sessions — and in **v0.2**, a memory that *ranks by relevance, forgets what's stale, and can reason about what it knows*.
 
-It's an MCP server exposing four tools — **store**, **search**, **list**, and **forget** — backed by a single local SQLite file. Point Claude Desktop, Cursor, or any MCP client at it, and your agent can write things down and recall them later. Everything stays on your machine.
+It's an MCP server backed by a single local SQLite file. Point Claude Desktop, Cursor, or any MCP client at it, and your agent can write things down, search them by relevance, link them together, and recall them later. Everything stays on your machine.
 
-## Features (v0.1)
+## Features (v0.2)
 
 - 🧠 **Persistent memory across sessions** — what you save today is there tomorrow
-- 🔎 **Keyword search** with tag filtering and pagination
+- 🔎 **Ranked full-text search** — SQLite FTS5 with BM25 relevance scoring, prefix and phrase matching (no embeddings, no Ollama, no network)
+- ⏳ **Weighted decay** — memories you don't use gently fade and rank lower; the ones you act on stay sharp via `memory_reinforce`
+- 🗂️ **Contexts** — namespace memories per project or persona, all in the same file
+- 🕸️ **Memory graph** — link memories with typed relations (`see_also`, `depends_on`, `contradicts`…) and pull related context in one call
+- 🤔 **Reflection** — `memory_reflect` summarises a slice of memories using the client's own model via MCP sampling (no extra API key)
+- 📦 **Export / import** — back up, version-control, or share a memory bundle as JSON
 - 💾 **One local SQLite file** — no database server, no migrations, no setup
 - 🔌 **Works with any MCP client** — Claude Desktop, Cursor, and more
 - 🏠 **100% local** — no account, no API key, no network calls
-- ⚡ **Runs with `npx`** — nothing to clone or build
+- ⚡ **Runs with npx** — nothing to clone or build
 
 Requires **Node.js 22.5+** (it uses Node's built-in SQLite — no native modules to compile).
 
-> **Honest scope:** v0.1 ships plain **keyword** search. Semantic/vector memory, summarization, and a web dashboard are planned — see the [Roadmap](#roadmap). They are not built yet, and this README will not pretend otherwise.
+> Honest scope: search is keyword/full-text (FTS5), not vector/semantic. Local embedding-based recall remains on the roadmap. This README won't pretend otherwise.
 
 ## Install
 
-Add cognitive-mcp to your MCP client. For **Claude Desktop**, edit `claude_desktop_config.json`:
+Add `cognitive-mcp` to your MCP client. For Claude Desktop, edit `claude_desktop_config.json`:
 
 ```json
 {
@@ -44,95 +43,76 @@ Add cognitive-mcp to your MCP client. For **Claude Desktop**, edit `claude_deskt
 
 Restart the client. The memory file is created automatically at `~/.cognitive-mcp/memory.db` the first time a tool runs.
 
-<details>
-<summary><strong>Cursor &amp; other MCP clients</strong></summary>
-
-Any client that speaks MCP over stdio works. Use the same command (`npx -y cognitive-mcp`) wherever the client asks for an MCP server command.
-</details>
-
-<details>
-<summary><strong>Run from source (development)</strong></summary>
-
-```bash
-git clone https://github.com/think-zone/cognitive-mcp.git
-cd cognitive-mcp
-npm install
-npm run build
-```
-
-Then point your client at the built entry point:
-
-```json
-{
-  "mcpServers": {
-    "cognitive": {
-      "command": "node",
-      "args": ["/absolute/path/to/cognitive-mcp/dist/index.js"]
-    }
-  }
-}
-```
-</details>
-
 ## Tools
 
-| Tool | What it does | Arguments |
-|------|--------------|-----------|
-| `memory_store` | Save a fact/note with optional tags | `content` *(required)*, `tags[]` |
-| `memory_search` | Keyword search across memories | `query` *(required)*, `tags[]`, `limit`, `offset`, `response_format` |
-| `memory_list` | Browse memories, newest first | `tags[]`, `limit`, `offset`, `response_format` |
-| `memory_forget` | Delete a memory by id | `id` *(required)* |
+| Tool | What it does | Key arguments |
+| --- | --- | --- |
+| `memory_store` | Save a fact/note | `content` (required), `tags[]`, `context` |
+| `memory_search` | BM25-ranked full-text search, weighted by recency/use | `query` (required), `tags[]`, `context`, `limit`, `offset`, `response_format` |
+| `memory_list` | Browse memories, newest first | `tags[]`, `context`, `limit`, `offset`, `response_format` |
+| `memory_forget` | Delete a memory by id | `id` (required) |
+| `memory_reinforce` | Strengthen a memory so it decays slower and ranks higher | `id` (required) |
+| `memory_update` | Edit a memory's content/tags | `id`, `content` (required), `tags[]` |
+| `memory_link` | Create a typed link between two memories | `from_id`, `to_id` (required), `relation` |
+| `memory_context` | Fetch a memory plus everything linked to it | `id` (required) |
+| `memory_reflect` | Summarise a slice of memories via MCP sampling, store the brief | `prompt` (required), `tags[]`, `context`, `limit`, `store_result` |
+| `memory_export` | Export memories as a JSON bundle | `context` |
+| `memory_import` | Import a previously exported bundle | `bundle` (required) |
 
-`memory_search` matches every whitespace-separated term against memory content (case-insensitive). The read tools accept `response_format: "markdown" | "json"` (default `markdown`).
+`memory_search` ranks results by BM25 relevance combined with each memory's weight, so frequently used memories surface above equally-matching but stale ones. The read tools accept `response_format: "markdown" | "json"` (default markdown).
 
-### Example
+## How relevance & decay work
+
+Every memory carries a `weight` between `0.05` and `1.0`. New memories start at `1.0`. On each server startup, weights decay roughly **1% per day** since the memory was last accessed (floored at `0.05` — nothing is ever auto-deleted). Whenever a memory is returned by a search, its `last_accessed` is refreshed; calling `memory_reinforce` pulls its weight back toward `1.0`. The net effect: memory that matters stays prominent, and the rest quietly recedes — without you ever having to prune manually.
+
+## Example
 
 > **You:** Remember that I deploy on Fridays and my staging URL is staging.example.com.
-> **Agent** → `memory_store` → *Stored memory #1.*
->
-> *…a week later, brand-new session…*
->
+> **Agent →** `memory_store` **→** Stored memory #1.
+
+…a week later, brand-new session…
+
 > **You:** When do I usually deploy?
-> **Agent** → `memory_search` `{ query: "deploy" }` → *You deploy on Fridays (memory #1).*
+> **Agent →** `memory_search { query: "deploy" }` **→** You deploy on Fridays (memory #1).
+> **Agent →** `memory_reinforce { id: 1 }` **→** keeps that fact fresh for next time.
 
 ## Where memory is stored
 
 A single SQLite file at `~/.cognitive-mcp/memory.db`. Override the location with an environment variable:
 
-```bash
+```
 COGNITIVE_MCP_DB_PATH=/path/to/my-memory.db
 ```
 
-Back it up, sync it, or delete it to start fresh — it's just a file.
+Back it up, sync it, or delete it to start fresh — it's just a file. You can also move memories around with `memory_export` / `memory_import`.
 
 ## Roadmap
 
-Planned, **not yet shipped**:
+Planned, not yet shipped:
 
-- [ ] **v0.2 — Semantic search** via local embeddings (Ollama), so recall works by meaning, not just keywords
-- [ ] **v0.2 — `memory_summarize`** to condense many memories into a short brief
-- [ ] **v0.3 — Web dashboard** to browse and edit memories in the browser
-- [ ] Multi-agent shared memory
-- [ ] Plugin system for custom cognitive tools
+- **v0.3** — Semantic search via local embeddings (Ollama), so recall works by meaning as well as keywords
+- **v0.3** — Web dashboard to browse, edit, and visualise the memory graph in the browser
+- Multi-agent shared memory
+- Plugin system for custom cognitive tools
 
-The v0.2 items are good first contributions — issues and PRs welcome.
+Contributions welcome — see `CONTRIBUTING.md`.
 
 ## Part of the Think-Zone ecosystem
 
 | Repo | Description |
-|------|-------------|
-| **cognitive-mcp** | Persistent agent memory over MCP (this repo) |
-| [creator-os](https://github.com/think-zone/creator-os) | Local-first AI automation stack |
+| --- | --- |
+| `cognitive-mcp` | Persistent agent memory over MCP (this repo) |
+| `creator-os` | Local-first AI automation stack |
 
 ## Development
 
-```bash
+```
 npm install
-npm run build     # compile TypeScript to dist/
-npm run smoke     # spin up the server and exercise all four tools end-to-end
-npm run dev       # run from source with tsx
+npm run build   # compile TypeScript to dist/
+npm run smoke   # spin up the server and exercise every tool end-to-end
+npm run dev     # run from source with tsx
 ```
 
 ## License
 
-MIT © [Think-Zone](https://github.com/think-zone)
+MIT © Think-Zone
