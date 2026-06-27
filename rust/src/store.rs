@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use libsql::{params_from_iter, Builder, Cipher, Connection, Database, EncryptionConfig, Value};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::crypto::{self, Key};
 use crate::error::{Error, Result};
@@ -48,6 +49,9 @@ pub struct Memory {
     pub scope: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Epoch-millis after which this memory is expired and auto-purged; `None`
+    /// means it never expires.
+    pub expires_at: Option<i64>,
 }
 
 const SCHEMA: &[&str] = &[
@@ -57,14 +61,24 @@ const SCHEMA: &[&str] = &[
         tags TEXT NOT NULL DEFAULT '[]',
         scope TEXT NOT NULL DEFAULT 'agent:default',
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER
     )",
     "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)",
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at)",
     "CREATE TABLE IF NOT EXISTS person (
         person_id BLOB PRIMARY KEY,
         created_at INTEGER NOT NULL,
         key_version INTEGER NOT NULL DEFAULT 1
+    )",
+    // Per-person content key (random, sealed under field_key). Destroying this
+    // row crypto-shreds the person's attributes: the ciphertext becomes
+    // unrecoverable even if rows are later restored from a backup.
+    "CREATE TABLE IF NOT EXISTS person_key (
+        person_id BLOB PRIMARY KEY REFERENCES person(person_id),
+        enc_key BLOB NOT NULL,
+        created_at INTEGER NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS person_identifier (
         blind_index BLOB NOT NULL,
@@ -133,7 +147,34 @@ impl Store {
         for stmt in SCHEMA {
             self.conn.execute(stmt, ()).await.map_err(db_err)?;
         }
+        // Migration for databases created before TTL: add the column if absent.
+        // Errors with "duplicate column name" on fresh DBs — that's expected and
+        // harmless, so the result is intentionally ignored.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE memories ADD COLUMN expires_at INTEGER", ())
+            .await;
+        // Sweep anything already expired on startup.
+        self.purge_expired().await?;
         Ok(())
+    }
+
+    /// Delete all memories and person attributes whose TTL has elapsed.
+    /// Returns the total number of rows removed. Runs automatically on open.
+    pub async fn purge_expired(&self) -> Result<u64> {
+        let now = now_millis();
+        let mut removed = 0u64;
+        for sql in [
+            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM person_attribute WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        ] {
+            removed += self
+                .conn
+                .execute(sql, params_from_iter([Value::Integer(now)]))
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(removed)
     }
 
     // --- memories (scope contract) ------------------------------------------
@@ -143,21 +184,25 @@ impl Store {
         content: &str,
         tags: &[String],
         scope: Option<&str>,
+        ttl_seconds: Option<i64>,
     ) -> Result<Memory> {
         let scope = normalize_scope(scope);
         let tags = normalize_tags(tags);
         let tags_json = serde_json::to_string(&tags)?;
         let now = now_millis();
+        // A positive TTL sets an absolute expiry; non-positive / None = never.
+        let expires_at = ttl_seconds.filter(|&s| s > 0).map(|s| now + s * 1000);
         self.conn
             .execute(
-                "INSERT INTO memories (content, tags, scope, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO memories (content, tags, scope, created_at, updated_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params_from_iter([
                     Value::Text(content.to_string()),
                     Value::Text(tags_json),
                     Value::Text(scope.clone()),
                     Value::Integer(now),
                     Value::Integer(now),
+                    expires_at.map(Value::Integer).unwrap_or(Value::Null),
                 ]),
             )
             .await
@@ -169,6 +214,7 @@ impl Store {
             scope,
             created_at: now,
             updated_at: now,
+            expires_at,
         })
     }
 
@@ -185,10 +231,15 @@ impl Store {
     }
 
     async fn query(&self, terms: &[String], scopes: &[String], limit: i64) -> Result<Vec<Memory>> {
-        let mut sql =
-            String::from("SELECT id, content, tags, scope, created_at, updated_at FROM memories");
+        let mut sql = String::from(
+            "SELECT id, content, tags, scope, created_at, updated_at, expires_at FROM memories",
+        );
         let mut wheres: Vec<String> = Vec::new();
         let mut args: Vec<Value> = Vec::new();
+
+        // Never surface expired rows, even before the next purge sweep.
+        wheres.push("(expires_at IS NULL OR expires_at > ?)".to_string());
+        args.push(Value::Integer(now_millis()));
 
         for t in terms {
             wheres.push("LOWER(content) LIKE ?".to_string());
@@ -228,6 +279,7 @@ impl Store {
                 scope: row.get(3).map_err(db_err)?,
                 created_at: row.get(4).map_err(db_err)?,
                 updated_at: row.get(5).map_err(db_err)?,
+                expires_at: row.get(6).map_err(db_err)?,
             });
         }
         Ok(out)
@@ -348,7 +400,53 @@ impl Store {
         Ok(())
     }
 
+    /// Get (or lazily create) the per-person content key, sealed under the field
+    /// key. Destroying its row crypto-shreds everything encrypted under it.
+    async fn person_content_key(&self, person_id: &[u8; 16]) -> Result<Key> {
+        let pid = person_id.to_vec();
+        // Read any existing sealed key (scoped so the row borrow drops).
+        let existing: Option<Vec<u8>> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT enc_key FROM person_key WHERE person_id = ?1",
+                    params_from_iter([Value::Blob(pid.clone())]),
+                )
+                .await
+                .map_err(db_err)?;
+            match rows.next().await.map_err(db_err)? {
+                Some(row) => Some(row.get(0).map_err(db_err)?),
+                None => None,
+            }
+        };
+        if let Some(enc) = existing {
+            let mut raw = crypto::open(&self.field_key, &enc, &aad(b"person-key", &pid))?;
+            if raw.len() != 32 {
+                raw.zeroize();
+                return Err(Error::Crypto("person content key has wrong length".into()));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&raw);
+            raw.zeroize();
+            let key = Key::from_bytes(arr);
+            arr.zeroize();
+            return Ok(key);
+        }
+        // First attribute for this person: mint a fresh random content key.
+        let key = Key::random();
+        let enc = crypto::seal(&self.field_key, key.as_bytes(), &aad(b"person-key", &pid))?;
+        self.conn
+            .execute(
+                "INSERT INTO person_key (person_id, enc_key, created_at) VALUES (?1, ?2, ?3)",
+                params_from_iter([Value::Blob(pid), Value::Blob(enc), Value::Integer(now_millis())]),
+            )
+            .await
+            .map_err(db_err)?;
+        Ok(key)
+    }
+
     /// Attach an encrypted attribute (note/tier/observation) to a person.
+    /// Encrypted under the per-person content key so erasure can crypto-shred it.
     pub async fn add_attribute(
         &self,
         person_id: &[u8; 16],
@@ -356,11 +454,12 @@ impl Store {
         value: &str,
         expires_at: Option<i64>,
     ) -> Result<[u8; 16]> {
+        let content_key = self.person_content_key(person_id).await?;
         let attr = Uuid::new_v4();
         let attr_bytes = attr.as_bytes().to_vec();
         let mut ctx = person_id.to_vec();
         ctx.extend_from_slice(&attr_bytes);
-        let enc = crypto::seal(&self.field_key, value.as_bytes(), &aad(attr_type.as_bytes(), &ctx))?;
+        let enc = crypto::seal(&content_key, value.as_bytes(), &aad(attr_type.as_bytes(), &ctx))?;
         let now = now_millis();
         self.conn
             .execute(
@@ -381,35 +480,54 @@ impl Store {
         Ok(*attr.as_bytes())
     }
 
-    /// Decrypt all attributes for a person, oldest-first, as `(type, value)`.
+    /// Decrypt all non-expired attributes for a person, oldest-first, as
+    /// `(type, value)`.
     pub async fn get_attributes(&self, person_id: &[u8; 16]) -> Result<Vec<(String, String)>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT attr_id, attr_type, enc_value FROM person_attribute \
-                 WHERE person_id = ?1 ORDER BY created_at ASC",
-                params_from_iter([Value::Blob(person_id.to_vec())]),
-            )
-            .await
-            .map_err(db_err)?;
+        // Collect rows first (scoped) so the per-person key lookup can use conn.
+        let raw: Vec<(Vec<u8>, String, Vec<u8>)> = {
+            let now = now_millis();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT attr_id, attr_type, enc_value FROM person_attribute \
+                     WHERE person_id = ?1 AND (expires_at IS NULL OR expires_at > ?2) \
+                     ORDER BY created_at ASC",
+                    params_from_iter([Value::Blob(person_id.to_vec()), Value::Integer(now)]),
+                )
+                .await
+                .map_err(db_err)?;
+            let mut v = Vec::new();
+            while let Some(row) = rows.next().await.map_err(db_err)? {
+                v.push((
+                    row.get(0).map_err(db_err)?,
+                    row.get(1).map_err(db_err)?,
+                    row.get(2).map_err(db_err)?,
+                ));
+            }
+            v
+        };
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let content_key = self.person_content_key(person_id).await?;
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(db_err)? {
-            let attr_id: Vec<u8> = row.get(0).map_err(db_err)?;
-            let attr_type: String = row.get(1).map_err(db_err)?;
-            let enc: Vec<u8> = row.get(2).map_err(db_err)?;
+        for (attr_id, attr_type, enc) in raw {
             let mut ctx = person_id.to_vec();
             ctx.extend_from_slice(&attr_id);
-            let pt = crypto::open(&self.field_key, &enc, &aad(attr_type.as_bytes(), &ctx))?;
+            let pt = crypto::open(&content_key, &enc, &aad(attr_type.as_bytes(), &ctx))?;
             out.push((attr_type, String::from_utf8_lossy(&pt).into_owned()));
         }
         Ok(out)
     }
 
-    /// Right-to-forget: destroy a person's entire footprint (identifiers +
-    /// attributes + the person row).
+    /// Right-to-forget: destroy a person's entire footprint. The per-person
+    /// content key is deleted FIRST — crypto-shredding the attributes so they're
+    /// unrecoverable even if the ciphertext rows survive in a backup — then the
+    /// rows themselves are removed.
     pub async fn forget_person(&self, person_id: &[u8; 16]) -> Result<()> {
         let p = person_id.to_vec();
         for sql in [
+            "DELETE FROM person_key WHERE person_id = ?1",
             "DELETE FROM person_attribute WHERE person_id = ?1",
             "DELETE FROM person_identifier WHERE person_id = ?1",
             "DELETE FROM person WHERE person_id = ?1",
@@ -487,9 +605,9 @@ mod tests {
     #[tokio::test]
     async fn scope_isolation_and_purge() {
         let (_d, s) = open_tmp().await;
-        s.store_memory("default note", &[], None).await.unwrap();
-        s.store_memory("cb note", &[], Some("agent:cb")).await.unwrap();
-        s.store_memory("of note", &[], Some("agent:of")).await.unwrap();
+        s.store_memory("default note", &[], None, None).await.unwrap();
+        s.store_memory("cb note", &[], Some("agent:cb"), None).await.unwrap();
+        s.store_memory("of note", &[], Some("agent:of"), None).await.unwrap();
 
         let all = s.list(&[], 100).await.unwrap();
         assert_eq!(all.len(), 3);
@@ -513,8 +631,8 @@ mod tests {
     #[tokio::test]
     async fn search_and_forget() {
         let (_d, s) = open_tmp().await;
-        let m = s.store_memory("deploy on fridays", &[], None).await.unwrap();
-        s.store_memory("unrelated", &[], None).await.unwrap();
+        let m = s.store_memory("deploy on fridays", &[], None, None).await.unwrap();
+        s.store_memory("unrelated", &[], None, None).await.unwrap();
 
         assert_eq!(s.search("deploy", &[], 100).await.unwrap().len(), 1);
         assert_eq!(s.search("deploy fridays", &[], 100).await.unwrap().len(), 1); // AND
@@ -574,7 +692,7 @@ mod tests {
             let s = Store::open(&path_str, Key::random(), b"pep".to_vec())
                 .await
                 .unwrap();
-            s.store_memory(marker, &[], None).await.unwrap();
+            s.store_memory(marker, &[], None, None).await.unwrap();
             // store drops here -> connection + db closed, bytes flushed
         }
         let bytes = std::fs::read(&path).unwrap();
@@ -583,5 +701,70 @@ mod tests {
         let needle = marker.as_bytes();
         let found = bytes.windows(needle.len()).any(|w| w == needle);
         assert!(!found, "plaintext leaked into the encrypted database file");
+    }
+
+    async fn person_key_exists(s: &Store, p: &[u8; 16]) -> bool {
+        let mut rows = s
+            .conn
+            .query(
+                "SELECT 1 FROM person_key WHERE person_id = ?1",
+                params_from_iter([Value::Blob(p.to_vec())]),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn expired_memories_are_hidden_and_purged() {
+        let (_d, s) = open_tmp().await;
+        s.store_memory("keeps", &[], None, None).await.unwrap(); // never expires
+
+        // directly insert an already-expired row
+        let now = now_millis();
+        s.conn
+            .execute(
+                "INSERT INTO memories (content, tags, scope, created_at, updated_at, expires_at) \
+                 VALUES (?1, '[]', 'agent:default', ?2, ?2, ?3)",
+                params_from_iter([
+                    Value::Text("gone".into()),
+                    Value::Integer(now),
+                    Value::Integer(now - 1000),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        // reads exclude the expired row immediately, even before a purge sweep
+        let listed = s.list(&[], 100).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "keeps");
+
+        // purge physically removes it
+        let removed = s.purge_expired().await.unwrap();
+        assert!(removed >= 1);
+
+        // a future-dated TTL stays visible and carries its expiry
+        let m = s.store_memory("future", &[], None, Some(3600)).await.unwrap();
+        assert!(m.expires_at.is_some());
+        assert!(s.list(&[], 100).await.unwrap().iter().any(|x| x.content == "future"));
+    }
+
+    #[tokio::test]
+    async fn forget_person_crypto_shreds_the_key() {
+        let (_d, s) = open_tmp().await;
+        let p = s.resolve_or_create_person("h:cb", "x").await.unwrap();
+        s.add_attribute(&p, "note", "secret", None).await.unwrap();
+
+        // a per-person content key now backs the attributes
+        assert!(person_key_exists(&s, &p).await);
+        assert_eq!(s.get_attributes(&p).await.unwrap().len(), 1);
+
+        s.forget_person(&p).await.unwrap();
+
+        // the key row is destroyed -> ciphertext is crypto-shredded
+        assert!(!person_key_exists(&s, &p).await);
+        assert!(s.get_attributes(&p).await.unwrap().is_empty());
+        assert!(s.lookup_person("h:cb", "x").await.unwrap().is_none());
     }
 }

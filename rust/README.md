@@ -12,6 +12,11 @@ this `rust/` crate is the destination (see `../private/SECURITY-ARCHITECTURE.md`
 - **Pseudonymized identity resolution** — cross-platform identities map to an
   opaque person id via truncated keyed-HMAC blind indexes; no plaintext linkage
   on disk. (Library-only; intentionally **not** exposed over MCP yet.)
+- **Retention / TTL** — memories (and person attributes) can carry an expiry;
+  expired rows are hidden from reads immediately and physically purged on open.
+- **Crypto-shredding erasure** — each person's attributes are encrypted under a
+  per-person content key; `forget_person` destroys that key first, so the data is
+  unrecoverable even if the ciphertext rows survive in a backup.
 - **Envelope key bootstrap** — passphrase → Argon2id KEK → wraps a persisted DEK.
 - **MCP server** (rmcp, stdio) exposing the scoped memory tools:
   `memory_store`, `memory_search`, `memory_list`, `memory_forget`, `memory_purge`.
@@ -75,7 +80,8 @@ decrypt it.
 ## Status
 
 Working vertical slice: encrypted store + crypto + pseudonymization + MCP server
-+ **three key-custody modes** (keystore default, TPM-sealed, passphrase). 20 tests
-green incl. a real-TPM seal/unseal roundtrip. Next: macOS keychain/Secure-Enclave
-backend, retention/TTL purge + crypto-shredding, the local↔cloud signal boundary,
-and exposing the identity layer only after the Tier-0 legal gate clears.
++ **three key-custody modes** (keystore default, TPM-sealed, passphrase) +
+**retention/TTL + crypto-shredding erasure**. 22 tests green incl. a real-TPM
+seal/unseal roundtrip, TTL expiry/purge, and crypto-shred-on-forget. Next: macOS
+keychain/Secure-Enclave backend, the local↔cloud signal boundary, and exposing
+the identity layer only after the Tier-0 legal gate clears.

@@ -41,6 +41,8 @@ struct StoreReq {
     tags: Vec<String>,
     #[schemars(description = "Optional scope namespace (e.g. 'agent:cb'); defaults to 'agent:default'")]
     scope: Option<String>,
+    #[schemars(description = "Optional time-to-live in seconds; the memory auto-expires and is purged after this many seconds")]
+    ttl_seconds: Option<i64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -111,10 +113,14 @@ impl CognitiveServer {
     async fn memory_store(&self, Parameters(r): Parameters<StoreReq>) -> Result<String, McpError> {
         let m = self
             .store
-            .store_memory(&r.content, &r.tags, r.scope.as_deref())
+            .store_memory(&r.content, &r.tags, r.scope.as_deref(), r.ttl_seconds)
             .await
             .map_err(internal)?;
-        Ok(format!("Stored memory #{} in {}.", m.id, m.scope))
+        let ttl = m
+            .expires_at
+            .map(|_| format!(" (expires in {}s)", r.ttl_seconds.unwrap_or(0)))
+            .unwrap_or_default();
+        Ok(format!("Stored memory #{} in {}{}.", m.id, m.scope, ttl))
     }
 
     #[tool(description = "Keyword search across stored memories (case-insensitive, all terms must match). Optionally restrict to scopes.")]
