@@ -2,6 +2,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# rust build artifacts
+target/
+rust/target/
+
 # local memory stores
 *.db
 *.db-journal
@@ -14,3 +18,9 @@ dist/
 .DS_Store
 .env
 .env.*
+
+# private design notes — never publish (sensitive application context)
+private/
+
+# editor MCP config — contains local secrets (passphrase/pepper), never publish
+.cursor/

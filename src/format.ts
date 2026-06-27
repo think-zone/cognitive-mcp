@@ -1,9 +1,10 @@
-import type { Memory, Page } from "./db.js";
+import { DEFAULT_SCOPE, type Memory, type Page } from "./db.js";
 
 /** Render one memory as a two-line markdown bullet. */
 export function formatMemoryLine(m: Memory): string {
   const tags = m.tags.length ? `  _[${m.tags.join(", ")}]_` : "";
-  return `- **#${m.id}** ${m.content}${tags}\n  <sub>${m.created_at}</sub>`;
+  const scope = m.scope && m.scope !== DEFAULT_SCOPE ? `  \`${m.scope}\`` : "";
+  return `- **#${m.id}** ${m.content}${tags}${scope}\n  <sub>${m.created_at}</sub>`;
 }
 
 /** Render a page of memories as human-readable markdown. */
