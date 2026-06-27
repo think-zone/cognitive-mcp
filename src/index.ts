@@ -2,20 +2,42 @@
 /**
  * cognitive-mcp — persistent, local-first memory for AI agents over MCP.
  *
- * Four tools, one SQLite file, stdio transport. No server, no account, no cloud.
- *   - memory_store   save a note/fact with optional tags
- *   - memory_search  keyword search across stored memories
- *   - memory_list    browse the most recent memories
+ * Five tools, one SQLite file, stdio transport. No server, no account, no cloud.
+ *   - memory_store   save a note/fact with optional tags + scope
+ *   - memory_search  keyword search across stored memories (optionally per scope)
+ *   - memory_list    browse the most recent memories (optionally per scope)
  *   - memory_forget  delete a memory by id
+ *   - memory_purge   delete every memory in a scope (namespace-level forget)
+ *
+ * Scopes namespace memory so multiple agents can share one store: `agent:<id>`
+ * for private working memory, `shared:<key>` for cross-agent memory. Omitting a
+ * scope keeps the v0.1 single-pool behaviour (everything in `agent:default`).
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { MemoryStore, resolveDbPath, type Memory, type Page } from "./db.js";
+import { MemoryStore, resolveDbPath, DEFAULT_SCOPE, type Memory, type Page } from "./db.js";
 import { formatPageMarkdown } from "./format.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
+
+// --- Shared input schemas ---------------------------------------------------
+/** A single scope label to write into. */
+const scopeInput = z
+  .string()
+  .min(1)
+  .max(128)
+  .describe(
+    `Namespace for this memory. Convention: 'agent:<id>' for private memory, 'shared:<key>' for cross-agent memory. Defaults to '${DEFAULT_SCOPE}'.`
+  );
+
+/** Zero or more scopes to restrict a read to. Empty/omitted = all scopes. */
+const scopesInput = z
+  .array(z.string().min(1).max(128))
+  .max(32)
+  .optional()
+  .describe("Only return memories in these scopes. Omit to search every scope.");
 
 enum ResponseFormat {
   MARKDOWN = "markdown",
@@ -27,6 +49,7 @@ const MemoryObject = z.object({
   id: z.number().describe("Unique memory id"),
   content: z.string().describe("The stored text"),
   tags: z.array(z.string()).describe("Tags attached to the memory"),
+  scope: z.string().describe("Namespace the memory lives in"),
   created_at: z.string().describe("ISO-8601 creation timestamp"),
   updated_at: z.string().describe("ISO-8601 last-update timestamp"),
 });
@@ -72,8 +95,9 @@ Use this whenever the user shares something worth remembering across conversatio
 Args:
   - content (string, required): the text to remember (1-10000 chars)
   - tags (string[], optional): short labels to categorise the memory for later filtering (max 32)
+  - scope (string, optional): namespace for this memory ('agent:<id>' private, 'shared:<key>' shared); defaults to '${DEFAULT_SCOPE}'
 
-Returns: { memory: { id, content, tags, created_at, updated_at } } — the stored memory with its assigned numeric id.`,
+Returns: { memory: { id, content, tags, scope, created_at, updated_at } } — the stored memory with its assigned numeric id.`,
     inputSchema: {
       content: z
         .string()
@@ -85,6 +109,7 @@ Returns: { memory: { id, content, tags, created_at, updated_at } } — the store
         .max(32)
         .optional()
         .describe("Optional labels to categorise this memory"),
+      scope: scopeInput.optional(),
     },
     outputSchema: { memory: MemoryObject },
     annotations: {
@@ -94,11 +119,14 @@ Returns: { memory: { id, content, tags, created_at, updated_at } } — the store
       openWorldHint: false,
     },
   },
-  async ({ content, tags }) => {
-    const memory: Memory = store.store(content, tags ?? []);
+  async ({ content, tags, scope }) => {
+    const memory: Memory = store.store(content, tags ?? [], scope);
     const tagText = memory.tags.length ? ` [tags: ${memory.tags.join(", ")}]` : "";
+    const scopeText = memory.scope !== DEFAULT_SCOPE ? ` in ${memory.scope}` : "";
     return {
-      content: [{ type: "text" as const, text: `Stored memory #${memory.id}${tagText}.` }],
+      content: [
+        { type: "text" as const, text: `Stored memory #${memory.id}${scopeText}${tagText}.` },
+      ],
       structuredContent: { memory },
     };
   }
@@ -118,6 +146,7 @@ Args:
   - tags (string[], optional): only return memories that carry ALL of these tags
   - limit (number, 1-100, default 20): max results to return
   - offset (number, default 0): results to skip, for pagination
+  - scopes (string[], optional): only search within these namespaces; omit to search every scope
   - response_format ('markdown' | 'json', default 'markdown')
 
 Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
@@ -132,6 +161,7 @@ Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
         .max(32)
         .optional()
         .describe("Only return memories carrying all of these tags"),
+      scopes: scopesInput,
       limit: z.number().int().min(1).max(100).default(20).describe("Max results to return"),
       offset: z.number().int().min(0).default(0).describe("Results to skip (pagination)"),
       response_format: z
@@ -147,8 +177,8 @@ Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
       openWorldHint: false,
     },
   },
-  async ({ query, tags, limit, offset, response_format }) => {
-    const page = store.search(query, tags ?? [], limit, offset);
+  async ({ query, tags, scopes, limit, offset, response_format }) => {
+    const page = store.search(query, tags ?? [], limit, offset, scopes ?? []);
     return pageResult(
       page,
       response_format,
@@ -167,6 +197,7 @@ server.registerTool(
 
 Args:
   - tags (string[], optional): only return memories carrying ALL of these tags
+  - scopes (string[], optional): only list memories in these namespaces; omit to list every scope
   - limit (number, 1-100, default 20)
   - offset (number, default 0)
   - response_format ('markdown' | 'json', default 'markdown')
@@ -178,6 +209,7 @@ Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
         .max(32)
         .optional()
         .describe("Only return memories carrying all of these tags"),
+      scopes: scopesInput,
       limit: z.number().int().min(1).max(100).default(20).describe("Max results to return"),
       offset: z.number().int().min(0).default(0).describe("Results to skip (pagination)"),
       response_format: z
@@ -193,8 +225,8 @@ Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
       openWorldHint: false,
     },
   },
-  async ({ tags, limit, offset, response_format }) => {
-    const page = store.list(limit, offset, tags ?? []);
+  async ({ tags, scopes, limit, offset, response_format }) => {
+    const page = store.list(limit, offset, tags ?? [], scopes ?? []);
     return pageResult(page, response_format, "Recent memories", "No memories stored yet.");
   }
 );
@@ -234,6 +266,47 @@ Returns: { id, deleted } — 'deleted' is false if no memory had that id.`,
     return {
       content: [{ type: "text" as const, text }],
       structuredContent: { id, deleted },
+    };
+  }
+);
+
+// --- memory_purge -----------------------------------------------------------
+server.registerTool(
+  "memory_purge",
+  {
+    title: "Purge Scope",
+    description: `Permanently delete EVERY memory in a scope (namespace). This cannot be undone.
+
+Use this for retention / right-to-forget policy — dropping an entire namespace
+(e.g. one agent's private memory) in a single call. To remove a single memory,
+use memory_forget instead.
+
+Args:
+  - scope (string, required): the namespace to empty (e.g. 'agent:cb', 'shared:fans')
+
+Returns: { scope, deleted } — 'deleted' is the number of memories removed.`,
+    inputSchema: {
+      scope: scopeInput,
+    },
+    outputSchema: {
+      scope: z.string().describe("The scope that was purged"),
+      deleted: z.number().describe("How many memories were deleted"),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ scope }) => {
+    const deleted = store.purgeScope(scope);
+    const noun = deleted === 1 ? "memory" : "memories";
+    return {
+      content: [
+        { type: "text" as const, text: `Purged ${deleted} ${noun} from scope ${scope}.` },
+      ],
+      structuredContent: { scope, deleted },
     };
   }
 );

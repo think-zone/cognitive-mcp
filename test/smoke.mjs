@@ -41,8 +41,14 @@ try {
   // tools/list
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
-  check("lists exactly four tools", names.length === 4, `got [${names.join(", ")}]`);
-  for (const expected of ["memory_forget", "memory_list", "memory_search", "memory_store"]) {
+  check("lists exactly five tools", names.length === 5, `got [${names.join(", ")}]`);
+  for (const expected of [
+    "memory_forget",
+    "memory_list",
+    "memory_purge",
+    "memory_search",
+    "memory_store",
+  ]) {
     check(`exposes ${expected}`, names.includes(expected));
   }
 
@@ -119,6 +125,84 @@ try {
 
   const after = await client.callTool({ name: "memory_list", arguments: { response_format: "json" } });
   check("one memory remains after forget", after.structuredContent?.total === 1);
+
+  // --- scopes ---------------------------------------------------------------
+  // remaining memory (idB) was stored without a scope -> default namespace
+  check("unscoped memory lands in agent:default", after.structuredContent?.memories?.[0]?.scope === "agent:default");
+
+  // store into three distinct scopes
+  const cb = await client.callTool({
+    name: "memory_store",
+    arguments: { content: "tipper RoyalFan converts on goal hits", tags: ["lead"], scope: "agent:cb" },
+  });
+  check("store honours scope", cb.structuredContent?.memory?.scope === "agent:cb");
+  const idCb = cb.structuredContent?.memory?.id;
+
+  await client.callTool({
+    name: "memory_store",
+    arguments: { content: "OF welcome email template v2", scope: "agent:of" },
+  });
+  await client.callTool({
+    name: "memory_store",
+    arguments: { content: "fan_42 = high-value cross-platform lead", tags: ["lead"], scope: "shared:fans" },
+  });
+
+  // list filtered to a single scope
+  const onlyCb = await client.callTool({
+    name: "memory_list",
+    arguments: { scopes: ["agent:cb"], response_format: "json" },
+  });
+  check(
+    "list scope filter isolates one namespace",
+    onlyCb.structuredContent?.total === 1 && onlyCb.structuredContent?.memories?.[0]?.id === idCb
+  );
+
+  // list spanning multiple scopes
+  const multi = await client.callTool({
+    name: "memory_list",
+    arguments: { scopes: ["agent:cb", "shared:fans"], response_format: "json" },
+  });
+  check("list spans multiple scopes", multi.structuredContent?.total === 2);
+
+  // search constrained by scope
+  const scopedSearch = await client.callTool({
+    name: "memory_search",
+    arguments: { query: "lead", scopes: ["shared:fans"], response_format: "json" },
+  });
+  check(
+    "search respects scope filter",
+    scopedSearch.structuredContent?.total === 1 &&
+      scopedSearch.structuredContent?.memories?.[0]?.scope === "shared:fans"
+  );
+
+  // unscoped search sees every namespace: "fan" is in agent:cb (RoyalFan)
+  // and shared:fans (fan_42) content, across two different scopes
+  const allFan = await client.callTool({
+    name: "memory_search",
+    arguments: { query: "fan", response_format: "json" },
+  });
+  check("unscoped search spans all scopes", allFan.structuredContent?.total === 2);
+
+  // purge an entire scope
+  const purge = await client.callTool({ name: "memory_purge", arguments: { scope: "agent:cb" } });
+  check("purge reports deleted count", purge.structuredContent?.deleted === 1);
+
+  const cbGone = await client.callTool({
+    name: "memory_list",
+    arguments: { scopes: ["agent:cb"], response_format: "json" },
+  });
+  check("purged scope is empty", cbGone.structuredContent?.total === 0);
+
+  // purge leaves other scopes untouched
+  const ofLeft = await client.callTool({
+    name: "memory_list",
+    arguments: { scopes: ["agent:of"], response_format: "json" },
+  });
+  check("purge does not touch other scopes", ofLeft.structuredContent?.total === 1);
+
+  // purging an empty/unknown scope deletes nothing
+  const purge0 = await client.callTool({ name: "memory_purge", arguments: { scope: "agent:cb" } });
+  check("purge of empty scope deletes nothing", purge0.structuredContent?.deleted === 0);
 
   await client.close();
 } catch (err) {

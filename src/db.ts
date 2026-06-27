@@ -3,11 +3,19 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+/**
+ * The default scope a memory lands in when none is supplied. Keeps the v0.1
+ * single-pool behaviour intact: existing callers that never pass a scope keep
+ * reading and writing one shared namespace.
+ */
+export const DEFAULT_SCOPE = "agent:default";
+
 /** A single stored memory. */
 export interface Memory {
   id: number;
   content: string;
   tags: string[];
+  scope: string;
   created_at: string;
   updated_at: string;
 }
@@ -26,6 +34,7 @@ interface MemoryRow {
   id: number;
   content: string;
   tags: string; // JSON array of strings
+  scope: string;
   created_at: string;
   updated_at: string;
 }
@@ -52,6 +61,32 @@ export function normalizeTags(tags: string[]): string[] {
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Normalize a scope label. Trims surrounding whitespace and falls back to
+ * {@link DEFAULT_SCOPE} for empty/blank input, so a missing scope is never an
+ * error — it just means "the default namespace". Convention is `agent:<id>` for
+ * private working memory and `shared:<key>` for cross-agent memory, but the
+ * store does not enforce that shape — any non-blank label is a valid scope.
+ */
+export function normalizeScope(scope?: string): string {
+  const s = (scope ?? "").trim();
+  return s.length > 0 ? s : DEFAULT_SCOPE;
+}
+
+/** De-duplicate and trim a list of scopes, preserving first-seen order. */
+export function normalizeScopes(scopes: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of scopes) {
+    const s = raw.trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
   }
   return out;
 }
@@ -85,11 +120,33 @@ export class MemoryStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
         tags TEXT NOT NULL DEFAULT '[]',
+        scope TEXT NOT NULL DEFAULT '${DEFAULT_SCOPE}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
     `);
+    this.migrate();
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);`
+    );
+  }
+
+  /**
+   * Forward-only migrations for databases created by an earlier version.
+   * Adds the `scope` column to pre-scope stores; existing rows fall into
+   * {@link DEFAULT_SCOPE}, preserving the old single-pool behaviour.
+   */
+  private migrate(): void {
+    const columns = this.db
+      .prepare(`PRAGMA table_info(memories)`)
+      .all() as unknown as Array<{ name: string }>;
+    const hasScope = columns.some((c) => c.name === "scope");
+    if (!hasScope) {
+      this.db.exec(
+        `ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT '${DEFAULT_SCOPE}';`
+      );
+    }
   }
 
   private rowToMemory(row: MemoryRow): Memory {
@@ -106,24 +163,27 @@ export class MemoryStore {
       id: row.id,
       content: row.content,
       tags,
+      scope: row.scope ?? DEFAULT_SCOPE,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
   }
 
   /** Save a new memory and return it (with its assigned id and timestamps). */
-  store(content: string, tags: string[] = []): Memory {
+  store(content: string, tags: string[] = [], scope?: string): Memory {
     const now = new Date().toISOString();
     const normalized = normalizeTags(tags);
+    const resolvedScope = normalizeScope(scope);
     const info = this.db
       .prepare(
-        `INSERT INTO memories (content, tags, created_at, updated_at) VALUES (?, ?, ?, ?)`
+        `INSERT INTO memories (content, tags, scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
       )
-      .run(content, JSON.stringify(normalized), now, now);
+      .run(content, JSON.stringify(normalized), resolvedScope, now, now);
     return {
       id: Number(info.lastInsertRowid),
       content,
       tags: normalized,
+      scope: resolvedScope,
       created_at: now,
       updated_at: now,
     };
@@ -142,23 +202,42 @@ export class MemoryStore {
     return Number(this.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id).changes) > 0;
   }
 
-  /** Browse memories newest-first, optionally filtered by tags. */
-  list(limit: number, offset: number, tags: string[] = []): Page {
-    return this.query({ terms: [], tags, limit, offset });
+  /**
+   * Delete every memory in a scope. Returns how many rows were removed.
+   * This is the scope-level purge backing retention / right-to-forget policy —
+   * dropping an entire namespace (e.g. one agent's private memory) in one call.
+   */
+  purgeScope(scope: string): number {
+    const resolved = normalizeScope(scope);
+    return Number(
+      this.db.prepare(`DELETE FROM memories WHERE scope = ?`).run(resolved).changes
+    );
   }
 
-  /** Keyword search: every term must appear in content; optional tag filter. */
-  search(query: string, tags: string[], limit: number, offset: number): Page {
-    return this.query({ terms: tokenize(query), tags, limit, offset });
+  /** Browse memories newest-first, optionally filtered by tags and scope. */
+  list(limit: number, offset: number, tags: string[] = [], scopes: string[] = []): Page {
+    return this.query({ terms: [], tags, scopes, limit, offset });
+  }
+
+  /** Keyword search: every term must appear in content; optional tag + scope filter. */
+  search(
+    query: string,
+    tags: string[],
+    limit: number,
+    offset: number,
+    scopes: string[] = []
+  ): Page {
+    return this.query({ terms: tokenize(query), tags, scopes, limit, offset });
   }
 
   private query(opts: {
     terms: string[];
     tags: string[];
+    scopes: string[];
     limit: number;
     offset: number;
   }): Page {
-    const { terms, tags, limit, offset } = opts;
+    const { terms, tags, scopes, limit, offset } = opts;
     const where: string[] = [];
     const params: (string | number)[] = [];
 
@@ -170,6 +249,11 @@ export class MemoryStore {
       // tags are stored as a JSON array of strings; match the quoted token
       where.push(`LOWER(tags) LIKE ?`);
       params.push(`%${JSON.stringify(tag).toLowerCase()}%`);
+    }
+    const scopeFilter = normalizeScopes(scopes);
+    if (scopeFilter.length) {
+      where.push(`scope IN (${scopeFilter.map(() => "?").join(", ")})`);
+      params.push(...scopeFilter);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
