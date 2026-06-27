@@ -21,3 +21,6 @@ rust/target/
 
 # private design notes — never publish (sensitive application context)
 private/
+
+# editor MCP config — contains local secrets (passphrase/pepper), never publish
+.cursor/
