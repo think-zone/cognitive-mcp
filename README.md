@@ -6,6 +6,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Think-Zone](https://img.shields.io/badge/Think--Zone-Ecosystem-blueviolet)](https://github.com/think-zone)
 
+> [!NOTE]
+> **Looking for the encrypted build?** A security-focused **Rust rewrite** lives in
+> [`rust/`](rust/) — full-database + field encryption, OS-keychain/TPM/passphrase
+> key custody, pseudonymized identity resolution, retention/TTL, and
+> crypto-shredding erasure. It's the successor for deployments that hold sensitive
+> data. This top-level TypeScript build remains the simple, local-first version.
+
 ---
 
 ## What it does
