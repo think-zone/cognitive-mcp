@@ -31,9 +31,10 @@ const PEPPER_ENTRY: &str = "pepper";
 pub fn resolve_keys(db_path: &str) -> Result<(Key, Vec<u8>)> {
     match std::env::var("COGNITIVE_MCP_KEY_MODE").ok().as_deref() {
         None | Some("keystore") => keystore_mode(),
+        Some("tpm") => tpm_mode(db_path),
         Some("passphrase") => passphrase_mode(db_path),
         Some(other) => Err(Error::Crypto(format!(
-            "unknown COGNITIVE_MCP_KEY_MODE '{other}' (use 'keystore' or 'passphrase')"
+            "unknown COGNITIVE_MCP_KEY_MODE '{other}' (use 'keystore', 'tpm', or 'passphrase')"
         ))),
     }
 }
@@ -42,6 +43,7 @@ pub fn resolve_keys(db_path: &str) -> Result<(Key, Vec<u8>)> {
 pub fn active_mode() -> &'static str {
     match std::env::var("COGNITIVE_MCP_KEY_MODE").ok().as_deref() {
         Some("passphrase") => "passphrase (attended)",
+        Some("tpm") => "tpm (hardware-sealed)",
         _ => "keystore (OS keychain)",
     }
 }
@@ -96,6 +98,54 @@ fn load_or_create_keystore_key(entry_name: &str) -> Result<Key> {
         }
         Err(e) => Err(Error::Crypto(format!("keyring read ({entry_name}): {e}"))),
     }
+}
+
+// --- TPM-sealed mode -------------------------------------------------------
+// The DEK and pepper are sealed by a non-exportable TPM key and stored as
+// sidecar blobs next to the database. The blobs are useless without this
+// machine's TPM, and the wrapping key cannot be exfiltrated for offline use.
+
+#[cfg(windows)]
+fn tpm_mode(db_path: &str) -> Result<(Key, Vec<u8>)> {
+    if !crate::tpm::is_available() {
+        return Err(Error::Crypto(
+            "TPM / Platform Crypto Provider not available; use COGNITIVE_MCP_KEY_MODE=keystore or passphrase".into(),
+        ));
+    }
+    let dek = load_or_seal_key(&format!("{db_path}.dek.tpm"))?;
+    let pepper = load_or_seal_key(&format!("{db_path}.pepper.tpm"))?;
+    Ok((dek, pepper.as_bytes().to_vec()))
+}
+
+#[cfg(windows)]
+fn load_or_seal_key(path: &str) -> Result<Key> {
+    use std::fs;
+    if let Ok(sealed) = fs::read(path) {
+        let mut pt = crate::tpm::unseal(&sealed).map_err(|e| Error::Crypto(format!("tpm unseal: {e}")))?;
+        if pt.len() != 32 {
+            pt.zeroize();
+            return Err(Error::Crypto("tpm-sealed key has wrong length".into()));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&pt);
+        pt.zeroize();
+        let key = Key::from_bytes(arr);
+        arr.zeroize();
+        Ok(key)
+    } else {
+        let key = Key::random();
+        let sealed =
+            crate::tpm::seal(key.as_bytes()).map_err(|e| Error::Crypto(format!("tpm seal: {e}")))?;
+        fs::write(path, &sealed).map_err(|e| Error::Db(format!("write sealed key: {e}")))?;
+        Ok(key)
+    }
+}
+
+#[cfg(not(windows))]
+fn tpm_mode(_db_path: &str) -> Result<(Key, Vec<u8>)> {
+    Err(Error::Crypto(
+        "TPM mode is Windows-only in this build; use COGNITIVE_MCP_KEY_MODE=keystore or passphrase".into(),
+    ))
 }
 
 fn passphrase_mode(db_path: &str) -> Result<(Key, Vec<u8>)> {

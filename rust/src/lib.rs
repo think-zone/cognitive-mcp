@@ -16,6 +16,8 @@ pub mod error;
 pub mod keys;
 pub mod pseudonym;
 pub mod store;
+#[cfg(windows)]
+pub mod tpm;
 
 pub use error::{Error, Result};
 pub use store::{Memory, Store, DEFAULT_SCOPE};

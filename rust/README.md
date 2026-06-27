@@ -45,8 +45,14 @@ logged-in user, **no secret in any config file**. This is the unattended default
 
 | Env var | Required | Meaning |
 |---------|----------|---------|
-| `COGNITIVE_MCP_KEY_MODE` | no | `keystore` (default) or `passphrase` |
+| `COGNITIVE_MCP_KEY_MODE` | no | `keystore` (default), `tpm`, or `passphrase` |
 | `COGNITIVE_MCP_DB_PATH` | no | defaults to `~/.cognitive-mcp/memory.db` |
+
+**`tpm`** (strongest, Windows) — set `COGNITIVE_MCP_KEY_MODE=tpm`. The DEK and
+pepper are sealed by a **non-exportable RSA key inside the TPM** (CNG Platform
+Crypto Provider) and stored as sidecar blobs (`.dek.tpm`, `.pepper.tpm`). The key
+cannot be extracted for offline use and the blobs only unseal on this machine's
+TPM. No secret in any config file. Needs only `COGNITIVE_MCP_DB_PATH`.
 
 **`passphrase`** (attended / portable) — set `COGNITIVE_MCP_KEY_MODE=passphrase`:
 
@@ -55,19 +61,21 @@ logged-in user, **no secret in any config file**. This is the unattended default
 | `COGNITIVE_MCP_PASSPHRASE` | yes | stretched with Argon2id into the key-encryption-key |
 | `COGNITIVE_MCP_PEPPER` | yes (≥16 chars) | blind-index pepper; keep secret, keep OUT of the DB dir |
 
-In keystore mode the DB is created on first run and the keys are minted into the
-keychain. In passphrase mode the DB plus two sidecars (`.salt`, wrapped `.dek`)
-are created on first run.
+The DB (and any sidecars) are created on first run. **Pick one mode per database**
+— the modes derive different keys, so switching mode on an existing DB can't
+decrypt it.
 
-> Threat note: keystore/DPAPI custody defeats device theft and key exfiltration,
-> but not live same-user malware. TPM 2.0 / Secure-Enclave non-exportable sealing
-> (which can wrap the keychain item) is the next hardening — see
-> `../private/SECURITY-ARCHITECTURE.md` §5.
+> Threat ladder: `passphrase` resists offline attack on a stolen disk but the
+> key lives in memory once entered; `keystore` (DPAPI) defeats device theft + key
+> exfiltration but a live same-user process can still read the key; `tpm` makes
+> the wrapping key **non-exportable** so even live malware can't steal it for
+> offline/other-machine use (it can still ask the TPM to unseal while running as
+> you). See `../private/SECURITY-ARCHITECTURE.md` §5.
 
 ## Status
 
 Working vertical slice: encrypted store + crypto + pseudonymization + MCP server
-+ **OS-keystore key custody** (keystore default, passphrase opt-in). Next:
-TPM/Secure-Enclave sealing + attended hardware mode, retention/TTL purge, the
-local↔cloud signal boundary, and exposing the identity layer only after the
-Tier-0 legal gate clears.
++ **three key-custody modes** (keystore default, TPM-sealed, passphrase). 20 tests
+green incl. a real-TPM seal/unseal roundtrip. Next: macOS keychain/Secure-Enclave
+backend, retention/TTL purge + crypto-shredding, the local↔cloud signal boundary,
+and exposing the identity layer only after the Tier-0 legal gate clears.
