@@ -1,0 +1,43 @@
+[package]
+name = "cognitive-mcp"
+version = "0.3.0-dev"
+edition = "2021"
+license = "MIT"
+description = "Persistent, local-first, encrypted memory for AI agents over MCP (Rust rewrite)"
+repository = "https://github.com/think-zone/cognitive-mcp"
+
+[[bin]]
+name = "cognitive-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "cognitive_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+# storage engine — full-database AES-256 encryption, cipher bundled into SQLite
+# (no OpenSSL/Perl/NASM on Windows MSVC)
+libsql = { version = "0.9.30", default-features = false, features = ["core", "encryption"] }
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+# crypto — pure Rust, audited primitives
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+# MCP server (stdio transport)
+rmcp = { version = "1.8", features = ["server", "macros", "transport-io"] }
+schemars = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# plumbing
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
