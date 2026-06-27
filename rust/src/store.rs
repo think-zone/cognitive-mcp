@@ -54,8 +54,9 @@ pub struct Memory {
     pub expires_at: Option<i64>,
 }
 
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS memories (
+/// Created first; on a pre-TTL DB this is a no-op and the `expires_at` column is
+/// added by the migration before any index references it.
+const MEMORIES_TABLE: &str = "CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
         tags TEXT NOT NULL DEFAULT '[]',
@@ -63,7 +64,9 @@ const SCHEMA: &[&str] = &[
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         expires_at INTEGER
-    )",
+    )";
+
+const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)",
     "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at)",
@@ -144,17 +147,20 @@ impl Store {
     }
 
     async fn init(&self) -> Result<()> {
-        for stmt in SCHEMA {
-            self.conn.execute(stmt, ()).await.map_err(db_err)?;
-        }
-        // Migration for databases created before TTL: add the column if absent.
-        // Errors with "duplicate column name" on fresh DBs — that's expected and
-        // harmless, so the result is intentionally ignored.
+        // 1) Base memories table (new DBs get expires_at here).
+        self.conn.execute(MEMORIES_TABLE, ()).await.map_err(db_err)?;
+        // 2) Migrate pre-TTL DBs: add the column BEFORE any index references it.
+        //    Errors with "duplicate column name" on fresh DBs — expected and
+        //    harmless, so the result is intentionally ignored.
         let _ = self
             .conn
             .execute("ALTER TABLE memories ADD COLUMN expires_at INTEGER", ())
             .await;
-        // Sweep anything already expired on startup.
+        // 3) Indexes + remaining tables (now safe to index expires_at).
+        for stmt in SCHEMA {
+            self.conn.execute(stmt, ()).await.map_err(db_err)?;
+        }
+        // 4) Sweep anything already expired on startup.
         self.purge_expired().await?;
         Ok(())
     }
