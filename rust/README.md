@@ -37,20 +37,37 @@ cargo run        # start the MCP server (needs env vars below)
 
 ## Running the server
 
-The server reads keys from the environment (interim custody — real OS-keystore /
-TPM custody is a later phase):
+Key custody is selected by `COGNITIVE_MCP_KEY_MODE`:
+
+**`keystore`** (default) — the DEK and the blind-index pepper live in the OS
+keychain (Windows Credential Manager; macOS later). DPAPI-protected, bound to the
+logged-in user, **no secret in any config file**. This is the unattended default.
+
+| Env var | Required | Meaning |
+|---------|----------|---------|
+| `COGNITIVE_MCP_KEY_MODE` | no | `keystore` (default) or `passphrase` |
+| `COGNITIVE_MCP_DB_PATH` | no | defaults to `~/.cognitive-mcp/memory.db` |
+
+**`passphrase`** (attended / portable) — set `COGNITIVE_MCP_KEY_MODE=passphrase`:
 
 | Env var | Required | Meaning |
 |---------|----------|---------|
 | `COGNITIVE_MCP_PASSPHRASE` | yes | stretched with Argon2id into the key-encryption-key |
 | `COGNITIVE_MCP_PEPPER` | yes (≥16 chars) | blind-index pepper; keep secret, keep OUT of the DB dir |
-| `COGNITIVE_MCP_DB_PATH` | no | defaults to `~/.cognitive-mcp/memory.db` |
 
-The DB plus two sidecars (`.salt`, wrapped `.dek`) are created on first run.
+In keystore mode the DB is created on first run and the keys are minted into the
+keychain. In passphrase mode the DB plus two sidecars (`.salt`, wrapped `.dek`)
+are created on first run.
+
+> Threat note: keystore/DPAPI custody defeats device theft and key exfiltration,
+> but not live same-user malware. TPM 2.0 / Secure-Enclave non-exportable sealing
+> (which can wrap the keychain item) is the next hardening — see
+> `../private/SECURITY-ARCHITECTURE.md` §5.
 
 ## Status
 
-Working vertical slice (store + crypto + pseudonymization + MCP server). Next:
-real key custody (TPM/OS keystore + attended mode), retention/TTL purge, the
+Working vertical slice: encrypted store + crypto + pseudonymization + MCP server
++ **OS-keystore key custody** (keystore default, passphrase opt-in). Next:
+TPM/Secure-Enclave sealing + attended hardware mode, retention/TTL purge, the
 local↔cloud signal boundary, and exposing the identity layer only after the
 Tier-0 legal gate clears.

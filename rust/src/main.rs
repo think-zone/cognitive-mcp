@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -22,7 +22,7 @@ use rmcp::{
 };
 use tracing_subscriber::EnvFilter;
 
-use cognitive_mcp::{keys, Store};
+use cognitive_mcp::{custody, Store};
 
 const DEFAULT_LIMIT: i64 = 20;
 
@@ -195,18 +195,14 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let passphrase = std::env::var("COGNITIVE_MCP_PASSPHRASE")
-        .map_err(|_| anyhow!("COGNITIVE_MCP_PASSPHRASE is required (it derives the encryption key)"))?;
-    let pepper = std::env::var("COGNITIVE_MCP_PEPPER")
-        .map_err(|_| anyhow!("COGNITIVE_MCP_PEPPER is required (blind-index pepper, keep it secret)"))?;
-    if pepper.len() < 16 {
-        return Err(anyhow!("COGNITIVE_MCP_PEPPER must be at least 16 characters"));
-    }
+    let (dek, pepper) = custody::resolve_keys(&db_path)?;
+    let store = Store::open(&db_path, dek, pepper).await?;
 
-    let dek = keys::load_or_init_dek(&db_path, passphrase.as_bytes())?;
-    let store = Store::open(&db_path, dek, pepper.into_bytes()).await?;
-
-    tracing::info!("cognitive-mcp v{} ready (db: {db_path})", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        "cognitive-mcp v{} ready (db: {db_path}, key custody: {})",
+        env!("CARGO_PKG_VERSION"),
+        custody::active_mode()
+    );
 
     let service = CognitiveServer::new(Arc::new(store))
         .serve(stdio())

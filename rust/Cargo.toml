@@ -20,6 +20,9 @@ path = "src/lib.rs"
 libsql = { version = "0.9.30", default-features = false, features = ["core", "encryption"] }
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+# key custody — OS keychain (Windows Credential Manager / macOS Keychain)
+keyring = { version = "3", features = ["windows-native"] }
+hex = "0.4"
 # crypto — pure Rust, audited primitives
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

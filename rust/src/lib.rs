@@ -11,6 +11,7 @@
 //! - **Secret hygiene**: key material lives in types that zeroize on drop.
 
 pub mod crypto;
+pub mod custody;
 pub mod error;
 pub mod keys;
 pub mod pseudonym;
