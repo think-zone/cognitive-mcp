@@ -18,8 +18,8 @@ use windows::Win32::Security::Cryptography::{
     NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey, NCryptFreeObject,
     NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO,
     BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM, CERT_KEY_SPEC, MS_PLATFORM_CRYPTO_PROVIDER,
-    NCRYPT_EXPORT_POLICY_PROPERTY, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_LENGTH_PROPERTY,
-    NCRYPT_OVERWRITE_KEY_FLAG, NCRYPT_PAD_OAEP_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_SILENT_FLAG,
+    NCRYPT_EXPORT_POLICY_PROPERTY, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
+    NCRYPT_LENGTH_PROPERTY, NCRYPT_PAD_OAEP_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_SILENT_FLAG,
 };
 
 /// Persisted name of our TPM-resident key-encryption key.
@@ -63,15 +63,13 @@ fn open_existing_key(prov: &Provider) -> Result<Key> {
     Ok(Key(h))
 }
 
-fn open_or_create_key(prov: &Provider) -> Result<Key> {
-    match open_existing_key(prov) {
-        Ok(k) => Ok(k),
-        Err(_) => create_key(prov),
+/// Get the persisted TPM key: open it if it exists, otherwise create it ONCE.
+/// Never overwrites — an existing key is never destroyed, so all sealed blobs
+/// stay decryptable. On a creation race we fall back to opening.
+fn get_key(prov: &Provider) -> Result<Key> {
+    if let Ok(k) = open_existing_key(prov) {
+        return Ok(k);
     }
-}
-
-/// Create a fresh non-exportable RSA-2048 key inside the TPM and finalize it.
-fn create_key(prov: &Provider) -> Result<Key> {
     let mut h = NCRYPT_KEY_HANDLE::default();
     let create = unsafe {
         NCryptCreatePersistedKey(
@@ -80,40 +78,39 @@ fn create_key(prov: &Provider) -> Result<Key> {
             BCRYPT_RSA_ALGORITHM,
             KEY_NAME,
             CERT_KEY_SPEC(0),
-            NCRYPT_OVERWRITE_KEY_FLAG,
+            NCRYPT_FLAGS(0), // NOT overwrite — never clobber an existing key
         )
     };
-    if let Err(e) = create {
-        // Lost a creation race: open whatever now exists.
-        if e.code() == NTE_EXISTS {
-            return open_existing_key(prov);
+    match create {
+        Ok(()) => {
+            let key = Key(h);
+            // Properties MUST be set before finalize.
+            let len_bytes = RSA_BITS.to_le_bytes();
+            unsafe {
+                NCryptSetProperty(
+                    NCRYPT_HANDLE(key.0 .0),
+                    NCRYPT_LENGTH_PROPERTY,
+                    &len_bytes,
+                    NCRYPT_SILENT_FLAG,
+                )?
+            };
+            // Export policy 0 => private key is non-exportable.
+            let export_policy: u32 = 0;
+            unsafe {
+                NCryptSetProperty(
+                    NCRYPT_HANDLE(key.0 .0),
+                    NCRYPT_EXPORT_POLICY_PROPERTY,
+                    &export_policy.to_le_bytes(),
+                    NCRYPT_SILENT_FLAG,
+                )?
+            };
+            unsafe { NCryptFinalizeKey(key.0, NCRYPT_SILENT_FLAG)? };
+            Ok(key)
         }
-        return Err(e);
+        // Another process created it first — open that one.
+        Err(e) if e.code() == NTE_EXISTS => open_existing_key(prov),
+        Err(e) => Err(e),
     }
-    let key = Key(h);
-
-    // Properties MUST be set before finalize.
-    let len_bytes = RSA_BITS.to_le_bytes();
-    unsafe {
-        NCryptSetProperty(
-            NCRYPT_HANDLE(key.0 .0),
-            NCRYPT_LENGTH_PROPERTY,
-            &len_bytes,
-            NCRYPT_SILENT_FLAG,
-        )?
-    };
-    // Export policy 0 => private key is non-exportable (explicit + enforced).
-    let export_policy: u32 = 0;
-    unsafe {
-        NCryptSetProperty(
-            NCRYPT_HANDLE(key.0 .0),
-            NCRYPT_EXPORT_POLICY_PROPERTY,
-            &export_policy.to_le_bytes(),
-            NCRYPT_SILENT_FLAG,
-        )?
-    };
-    unsafe { NCryptFinalizeKey(key.0, NCRYPT_SILENT_FLAG)? };
-    Ok(key)
 }
 
 fn oaep_info() -> BCRYPT_OAEP_PADDING_INFO {
@@ -133,7 +130,7 @@ pub fn is_available() -> bool {
 /// Creates the persisted TPM key on first use.
 pub fn seal(plaintext: &[u8]) -> Result<Vec<u8>> {
     let prov = open_provider()?;
-    let key = open_or_create_key(&prov)?;
+    let key = get_key(&prov)?;
     let pad = oaep_info();
     let pad_ptr: *const c_void = (&pad as *const BCRYPT_OAEP_PADDING_INFO).cast();
 
