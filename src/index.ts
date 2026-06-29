@@ -155,6 +155,7 @@ Returns: { total, count, offset, has_more, next_offset?, memories[] }`,
         .string()
         .min(1, "query must not be empty")
         .max(500, "query must not exceed 500 characters")
+        .refine((value) => value.trim().length > 0, "query must include at least one non-whitespace character")
         .describe("Keywords to search for"),
       tags: z
         .array(z.string().min(1).max(64))
